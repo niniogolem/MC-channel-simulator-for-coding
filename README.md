@@ -1,4 +1,5 @@
 Monte Carlo channel simulator for bit channel selection in Polar coding
+The main program is the Programa Principal notebook, you must customize the parameter on the 2nd cell before running the simulations according to the comments provided.
 
 Copyright (c) 2026 Sergio Huaman Kemper
 
