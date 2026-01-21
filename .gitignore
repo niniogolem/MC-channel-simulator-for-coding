@@ -1,0 +1,3 @@
+# Ignore .github folder and its contents
+.github/
+.vscode/
