@@ -9,8 +9,8 @@ import os
 # ==========================================
 # 1. CONFIGURACIÓN
 # ==========================================
-N = 128 # Longitud del Bloque (Bits totales)
-K = 64 # Bits de Información (Tasa = K/N)
+N = 1024 # Longitud del Bloque (Bits totales)
+K = 512 # Bits de Información (Tasa = K/N)
 n_frozen = N - K  # Número de bits congelados (Los peores canales)
 
 # Nombre de la carpeta (o usa '.' si están en la misma carpeta)
