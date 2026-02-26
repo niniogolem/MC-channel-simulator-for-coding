@@ -1,1 +1,4 @@
-# Para uso futuro
+.gitignore
+.envrc
+test_env.py
+.vscode/
