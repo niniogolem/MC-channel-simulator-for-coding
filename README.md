@@ -8,5 +8,5 @@ Python Notebook for simulation of a Wireless communication channel and Monte Car
 
 Copyright (c) 2026 Sergio Huaman Kemper
 
-Part of the code usese Python Sionna modules, which are distribute under Apache-2.0 license:
+Part of the code usese Python Sionna modules, which are distributed under Apache-2.0 license:
 Hoydis, J., Cammerer, S., Ait Aoudia, F., Nimier-David, M., Maggi, L., Marcus, G., Vem, A., & Keller, A. (2022). Sionna (Version 1.2.1) [Software]. https://nvlabs.github.io/sionna/
