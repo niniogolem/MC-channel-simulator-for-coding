@@ -1,5 +1,19 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python-envs.pythonProjects": []
+    "python-envs.pythonProjects": [],
+    "python.defaultInterpreterPath": "/home/sergio/.conda/envs/sionna/bin/python",
+    "python.terminal.activateEnvironment": true,
+
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/.conda/**": true,
+        "**/__pycache__/**": true
+    },
+
+    "search.exclude": {
+        "**/.conda/**": true,
+        "**/__pycache__/**": true
+    }
 }
