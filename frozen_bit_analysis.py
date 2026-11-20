@@ -9,12 +9,12 @@ import os
 # ==========================================
 # 1. CONFIGURACIÓN
 # ==========================================
-N = 1024 # Longitud del Bloque (Bits totales)
-K = 512 # Bits de Información (Tasa = K/N)
+N = 512 # Longitud del Bloque (Bits totales)
+K = 256 # Bits de Información (Tasa = K/N)
 n_frozen = N - K  # Número de bits congelados (Los peores canales)
 
 # Nombre de la carpeta (o usa '.' si están en la misma carpeta)
-folder_name = 'results_' + str(N) 
+folder_name = 'results_' + str(N) + '_2'  # Segunda iteracion de resultados para N=512, K=256
 file_pattern = '*.csv'
 
 print("--- Configuración del Sistema ---")
