@@ -2,3 +2,5 @@
 .envrc
 test_env.py
 .vscode/
+__pycache__/
+sandbox.ipynb
