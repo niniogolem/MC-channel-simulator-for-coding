@@ -10,8 +10,10 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-# Configura la GPU y los mensajes de TensorFlow antes de importar TF/Sionna.
-if os.getenv("CUDA_VISIBLE_DEVICES") is None:
+# Configura la GPU (o fuerza CPU con --cpu) y los mensajes de TensorFlow antes de importar TF/Sionna.
+if "--cpu" in sys.argv:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+elif os.getenv("CUDA_VISIBLE_DEVICES") is None:
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
@@ -22,7 +24,7 @@ import tensorflow as tf
 def configure_compute_device():
     gpus = tf.config.list_physical_devices('GPU')
     if not gpus:
-        return "CPU"
+        return "CPU", False
     for gpu in gpus:
         try:
             tf.config.experimental.set_memory_growth(gpu, True)
@@ -33,10 +35,10 @@ def configure_compute_device():
         device_name = details.get("device_name", gpus[0].name)
     except Exception:
         device_name = gpus[0].name
-    return f"GPU: {device_name}"
+    return f"GPU: {device_name}", True
 
 
-COMPUTE_DEVICE_INFO = configure_compute_device()
+COMPUTE_DEVICE_INFO, HAS_GPU = configure_compute_device()
 tf.get_logger().setLevel('ERROR')
 
 import sionna
@@ -92,7 +94,13 @@ CHANNEL_SNR_DEFAULTS = {
     "rice": -0.3,
     "lognormal": 2.4,
     "suzuki": 5.0,
+    "nakagami": 0.3,
+    "shadowed_rician": 0.5,
+    "impulsive": -1.9,
 }
+
+# Canales sin desvanecimiento multiplicativo (h = 1, permiten ecualizador 'no_eq').
+NON_FADING_CHANNELS = ("awgn", "impulsive")
 
 # Etiquetas y estilos de marcador compartidos para las curvas BER.
 CURVE_UNCODED = "Sin código"
@@ -113,11 +121,12 @@ AUTO_SNR_BISECTION_STEPS = 12
 BER_MIN_YLIM = 1e-6
 BER_FLOOR_YLIM = 1e-9
 
-# Claves de configuración que deben coincidir al reanudar un respaldo Monte Carlo.
-MC_BACKUP_KEYS = (
+# Claves obligatorias (retrocompatibles) y completas de configuración en respaldos Monte Carlo.
+MC_BACKUP_CORE_KEYS = (
     "N", "K", "bitsxsimb", "canal", "bloq_coher",
     "k_factor_db", "sigma_db", "ecualizador", "LLR_clip", "snr_simulacion"
 )
+MC_BACKUP_KEYS = MC_BACKUP_CORE_KEYS + ("m_nakagami", "imp_prob", "imp_gamma")
 
 
 # Calcula K a partir de N, la tasa seleccionada y bitsxsimb (ajustando múltiplos cuando aplica).
@@ -156,7 +165,101 @@ def save_mc_backup(backup_path, ber_bits, next_index, params):
         next_index=np.int64(next_index),
         meta_json=np.array(meta_json)
     )
-    os.replace(tmp_path, backup_path)
+    # Reintentos breves ante bloqueos temporales de archivo en Windows (antivirus/OneDrive).
+    for attempt in range(3):
+        try:
+            os.replace(tmp_path, backup_path)
+            return
+        except PermissionError:
+            if attempt == 2:
+                raise
+            time.sleep(0.05)
+
+
+# Evalúa los recursos de cómputo y memoria disponibles antes de simular y sugiere ajustes.
+def assess_system_resources(params, mode, has_gpu=HAS_GPU, mem_info=None, cpu_count=None,
+                            lock_n=False):
+    mem = mem_info if mem_info is not None else psutil.virtual_memory()
+    avail_gb = mem.available / (1024 ** 3)
+    mem_pct = float(mem.percent)
+    cores = cpu_count if cpu_count is not None else (os.cpu_count() or 1)
+
+    N = int(params['N'])
+    warnings = []
+    recommendations = {}
+
+    if mode == "mc":
+        lote_mc = int(params['lote_mc'])
+        num_iter = int(params['num_iter'])
+        total_ops = N * lote_mc * num_iter
+        est_batch_gb = (lote_mc * N * 64) / (1024 ** 3)
+
+        if mem_pct >= 75.0 or avail_gb < 2.0:
+            warnings.append(
+                f"Memoria RAM disponible limitada ({avail_gb:.1f} GB libres, {mem_pct:.0f}% en uso)."
+            )
+            recommendations['lote_mc'] = min(lote_mc, 500)
+            if not lock_n and N > 512:
+                recommendations['N'] = 512
+
+        if est_batch_gb > max(0.5, avail_gb * 0.4):
+            warnings.append(
+                f"El lote paralelo ({lote_mc} × N={N}, ~{est_batch_gb:.2f} GB estimados) "
+                "es alto para la RAM libre actual."
+            )
+            recommendations['lote_mc'] = min(
+                recommendations.get('lote_mc', lote_mc), max(100, min(lote_mc // 2, 1000))
+            )
+            if not lock_n and N > 512:
+                recommendations['N'] = min(recommendations.get('N', N), N // 2)
+
+        if not has_gpu and total_ops > 200_000_000:
+            warnings.append(
+                f"Ejecutando en CPU ({cores} hilos, sin GPU NVIDIA): {N} bit-canales × "
+                f"{lote_mc * num_iter:,} muestras puede tardar varias horas."
+            )
+            recommendations['lote_mc'] = min(recommendations.get('lote_mc', lote_mc), 500)
+            recommendations['num_iter'] = min(num_iter, 400)
+            if not lock_n and N > 256:
+                recommendations['N'] = min(recommendations.get('N', N), 256)
+
+    elif mode == "ber":
+        lote_ber = int(params['lote_berplot'])
+        ebno_pts = int(params['ebno_rango'])
+        list_scl = int(params['list_scl'])
+        est_ber_gb = (lote_ber * N * list_scl * 32) / (1024 ** 3)
+
+        if mem_pct >= 75.0 or avail_gb < 2.0 or est_ber_gb > max(0.5, avail_gb * 0.4):
+            warnings.append(
+                f"Memoria RAM disponible limitada ({avail_gb:.1f} GB libres, {mem_pct:.0f}% en uso) "
+                f"para lote BER={lote_ber} con SCL={list_scl}."
+            )
+            recommendations['lote_berplot'] = max(20, min(lote_ber // 2, 100))
+            if list_scl > 4:
+                recommendations['list_scl'] = 4
+
+        if not has_gpu and (N >= 1024 or ebno_pts > 15 or list_scl >= 8 or lote_ber > 100):
+            warnings.append(
+                f"Ejecutando en CPU ({cores} hilos, sin GPU NVIDIA): el barrido BER "
+                f"({ebno_pts} puntos, N={N}, SCL={list_scl}) puede ser muy lento."
+            )
+            recommendations['lote_berplot'] = min(
+                recommendations.get('lote_berplot', lote_ber), 100
+            )
+            recommendations['ebno_rango'] = min(ebno_pts, 11)
+            recommendations['list_scl'] = min(recommendations.get('list_scl', list_scl), 4)
+            if not lock_n and N >= 1024:
+                recommendations['N'] = 512
+
+    # Filtra recomendaciones que no reducen el valor actual.
+    recommendations = {k: v for k, v in recommendations.items() if v < params.get(k, v)}
+    summary = {
+        "has_gpu": has_gpu,
+        "avail_gb": avail_gb,
+        "mem_pct": mem_pct,
+        "cores": cores,
+    }
+    return warnings, recommendations, summary
 
 
 # Carga un respaldo Monte Carlo en formato .npz si existe y es válido.
@@ -307,6 +410,118 @@ def canalRayleighLognormal(bloq_coher, sigma_db, ebno_db, bitsxsimb, coderate, x
     return y, h, no
 
 
+# Genera muestras Gamma(m, m) de media unitaria compatibles con XLA (Marsaglia-Tsang).
+def _sample_gamma_unit_mean(shape, m_param):
+    m_tf = tf.cast(m_param, tf.float32)
+    alpha = tf.where(m_tf < 1.0, m_tf + 1.0, m_tf)
+    d = alpha - (1.0 / 3.0)
+    c = tf.math.rsqrt(9.0 * d)
+
+    accepted = tf.zeros(shape, dtype=tf.bool)
+    samples = tf.ones(shape, dtype=tf.float32)
+
+    def cond(acc, _samp):
+        return tf.reduce_any(tf.logical_not(acc))
+
+    def body(acc, samp):
+        z = sionna.phy.config.tf_rng.normal(shape, mean=0.0, stddev=1.0, dtype=tf.float32)
+        u = sionna.phy.config.tf_rng.uniform(shape, minval=1e-7, maxval=1.0, dtype=tf.float32)
+        v_base = 1.0 + c * z
+        v = v_base * v_base * v_base
+        v_safe = tf.maximum(v, 1e-7)
+        accept_cond = tf.logical_and(
+            v_base > 0.0,
+            tf.math.log(u) < (0.5 * z * z + d * (1.0 - v_safe + tf.math.log(v_safe)))
+        )
+        newly_acc = tf.logical_and(tf.logical_not(acc), accept_cond)
+        return tf.logical_or(acc, newly_acc), tf.where(newly_acc, d * v_safe, samp)
+
+    _, samples = tf.while_loop(cond, body, [accepted, samples])
+
+    # Aplica reducción exacta Gamma(m) = Gamma(m + 1) * U^(1/m) cuando 0.5 <= m < 1.
+    u_boost = sionna.phy.config.tf_rng.uniform(shape, minval=1e-7, maxval=1.0, dtype=tf.float32)
+    samples = tf.where(m_tf < 1.0, samples * tf.pow(u_boost, 1.0 / m_tf), samples)
+    return samples / m_tf
+
+
+# Canal Nakagami-m: envolvente Nakagami normalizada a potencia unitaria (m >= 0.5).
+@tf.function(jit_compile=True)
+def canalNakagami(bloq_coher, m_nakagami, ebno_db, bitsxsimb, coderate, x):
+    batch_size = tf.shape(x)[0]
+    bloq_coher = tf.cast(bloq_coher, tf.int32)
+    N = tf.shape(x)[-1]
+    no = sionna.phy.utils.ebnodb2no(ebno_db, bitsxsimb, coderate=coderate)
+    repeticiones = _fading_repetitions(N, bloq_coher)
+    awgn = _sample_complex_awgn(tf.shape(x), no)
+
+    potencia = _sample_gamma_unit_mean([batch_size, repeticiones], m_nakagami)
+    amp = tf.sqrt(tf.maximum(potencia, 1e-12))
+    phi = sionna.phy.config.tf_rng.uniform(
+        [batch_size, repeticiones],
+        minval=0.0,
+        maxval=tf.constant(2.0 * np.pi, tf.float32)
+    )
+    h_bloque = tf.complex(amp * tf.cos(phi), amp * tf.sin(phi))
+    h = tf.repeat(h_bloque, repeats=bloq_coher, axis=1)[:, :N]
+    y = h * x + awgn
+    return y, h, no
+
+
+# Canal Shadowed-Rician (Abdi / satelital LMS): LOS con sombreado Nakagami-m + NLOS Rayleigh.
+@tf.function(jit_compile=True)
+def canalShadowedRician(bloq_coher, k_factor_db, m_nakagami, ebno_db, bitsxsimb, coderate, x):
+    batch_size = tf.shape(x)[0]
+    bloq_coher = tf.cast(bloq_coher, tf.int32)
+    N = tf.shape(x)[-1]
+    no = sionna.phy.utils.ebnodb2no(ebno_db, bitsxsimb, coderate=coderate)
+    repeticiones = _fading_repetitions(N, bloq_coher)
+    awgn = _sample_complex_awgn(tf.shape(x), no)
+
+    k_lin = tf.pow(10.0, tf.cast(k_factor_db, tf.float32) / 10.0)
+    p_los = k_lin / (k_lin + 1.0)
+    p_nlos = 1.0 / (k_lin + 1.0)
+
+    sombreado_los = _sample_gamma_unit_mean([batch_size, repeticiones], m_nakagami)
+    amp_los = tf.sqrt(tf.maximum(p_los * sombreado_los, 1e-12))
+    phi = sionna.phy.config.tf_rng.uniform(
+        [batch_size, repeticiones],
+        minval=0.0,
+        maxval=tf.constant(2.0 * np.pi, tf.float32)
+    )
+    h_los = tf.complex(amp_los * tf.cos(phi), amp_los * tf.sin(phi))
+
+    g_real = sionna.phy.config.tf_rng.normal(
+        [batch_size, repeticiones], stddev=tf.sqrt(0.5 * p_nlos), dtype=tf.float32
+    )
+    g_imag = sionna.phy.config.tf_rng.normal(
+        [batch_size, repeticiones], stddev=tf.sqrt(0.5 * p_nlos), dtype=tf.float32
+    )
+    h_nlos = tf.complex(g_real, g_imag)
+
+    h = tf.repeat(h_los + h_nlos, repeats=bloq_coher, axis=1)[:, :N]
+    y = h * x + awgn
+    return y, h, no
+
+
+# Canal AWGN con ruido impulsivo (mezcla gaussiana Bernoulli-Gaussian de potencia total N0).
+@tf.function(jit_compile=True)
+def canalImpulsivo(imp_prob, imp_gamma, ebno_db, bitsxsimb, coderate, x):
+    no = sionna.phy.utils.ebnodb2no(ebno_db, bitsxsimb, coderate=coderate)
+    p_tf = tf.cast(imp_prob, tf.float32)
+    gamma_tf = tf.cast(imp_gamma, tf.float32)
+
+    # Normaliza varianza de fondo para que la potencia media total de ruido sea exactamente no.
+    no_bg = no / (1.0 + p_tf * gamma_tf)
+    ruido_bg = _sample_complex_awgn(tf.shape(x), no_bg)
+    ruido_imp = _sample_complex_awgn(tf.shape(x), gamma_tf * no_bg)
+
+    u = sionna.phy.config.tf_rng.uniform(tf.shape(x), minval=0.0, maxval=1.0, dtype=tf.float32)
+    mascara = tf.cast(u < p_tf, tf.complex64)
+    h = tf.complex(1.0, 0.0)
+    y = x + ruido_bg + mascara * ruido_imp
+    return y, h, no
+
+
 # Sin ecualización: conserva la señal recibida para canales AWGN.
 @tf.function(jit_compile=True)
 def sin_ecualizar(y, _h, no):
@@ -347,6 +562,19 @@ def apply_channel_and_equalizer(x, ebno_db, coderate, params, common_blocks):
     elif c == "suzuki":
         y, h, no = canalRayleighLognormal(
             params['bloq_coher'], params['sigma_db'], ebno_db, params['bitsxsimb'], coderate, x
+        )
+    elif c == "nakagami":
+        y, h, no = canalNakagami(
+            params['bloq_coher'], params['m_nakagami'], ebno_db, params['bitsxsimb'], coderate, x
+        )
+    elif c == "shadowed_rician":
+        y, h, no = canalShadowedRician(
+            params['bloq_coher'], params['k_factor_db'], params['m_nakagami'],
+            ebno_db, params['bitsxsimb'], coderate, x
+        )
+    elif c == "impulsive":
+        y, h, no = canalImpulsivo(
+            params['imp_prob'], params['imp_gamma'], ebno_db, params['bitsxsimb'], coderate, x
         )
     else:
         raise ValueError(f"Canal inválido: {c}")
@@ -601,7 +829,7 @@ class MonteCarloWorker(QThread):
 
             filename = default_ber_bits_csv_path(self.p, N)
             os.makedirs(os.path.dirname(filename), exist_ok=True)
-            pd.DataFrame({"BER bits": BER_bits}).to_csv(filename, index=True)
+            pd.DataFrame({"BER bits": BER_bits}).to_csv(filename, index=True, encoding="utf-8-sig")
 
             if os.path.exists(backup_file):
                 os.remove(backup_file)
@@ -957,7 +1185,10 @@ class PolarSimGUI(QMainWindow):
         form = QFormLayout(grp)
 
         self.combo_canal = QComboBox()
-        for c in ("suzuki", "awgn", "rayleigh", "rice", "lognormal"):
+        for c in (
+            "suzuki", "awgn", "rayleigh", "rice", "lognormal",
+            "nakagami", "shadowed_rician", "impulsive"
+        ):
             self.combo_canal.addItem(c)
         self.combo_canal.currentTextChanged.connect(self.on_channel_changed)
 
@@ -982,14 +1213,33 @@ class PolarSimGUI(QMainWindow):
         self.spin_sigma_db.setRange(0.1, 30.0)
         self.spin_sigma_db.setValue(6.0)
 
+        self.spin_m_nakagami = QDoubleSpinBox()
+        self.spin_m_nakagami.setRange(0.5, 20.0)
+        self.spin_m_nakagami.setSingleStep(0.5)
+        self.spin_m_nakagami.setValue(1.5)
+
+        self.spin_imp_prob = QDoubleSpinBox()
+        self.spin_imp_prob.setDecimals(3)
+        self.spin_imp_prob.setRange(0.001, 0.500)
+        self.spin_imp_prob.setSingleStep(0.01)
+        self.spin_imp_prob.setValue(0.050)
+
+        self.spin_imp_gamma = QDoubleSpinBox()
+        self.spin_imp_gamma.setRange(1.0, 1000.0)
+        self.spin_imp_gamma.setSingleStep(5.0)
+        self.spin_imp_gamma.setValue(50.0)
+
         self._add_row_with_tip(
             form, "Modelo de canal:", self.combo_canal,
-            "Modelo de desvanecimiento del canal inalámbrico:\n"
+            "Modelo de canal inalámbrico:\n"
             "• awgn: solo ruido gaussiano aditivo (sin desvanecimiento)\n"
-            "• rayleigh: desvanecimiento multitrayecto sin línea de vista (NLOS)\n"
-            "• rice: multitrayecto con línea de vista (usa Factor K)\n"
+            "• rayleigh: desvanecimiento multitrayecto NLOS\n"
+            "• rice: multitrayecto con LOS (usa Factor K)\n"
             "• lognormal: sombreado lento (usa σ)\n"
-            "• suzuki: Rayleigh × Lognormal, desvanecimiento rápido + lento (usa σ)"
+            "• suzuki: Rayleigh × Lognormal (usa σ)\n"
+            "• nakagami: desvanecimiento Nakagami-m (usa parámetro m)\n"
+            "• shadowed_rician: satelital LMS/NTN con LOS sombreada (usa K y m)\n"
+            "• impulsive: AWGN + ruido impulsivo Bernoulli-Gaussian (usa p y Γ)"
         )
         self._add_row_with_tip(
             form, "Bloque de coherencia:", self.spin_coher,
@@ -1001,10 +1251,10 @@ class PolarSimGUI(QMainWindow):
         form.addRow("", self.chk_flat_fading)
         self._add_row_with_tip(
             form, "Factor K de Rice [dB]:", self.spin_k_db,
-            "Relación de potencia LOS/NLOS en dB (solo canal Rice).\n"
+            "Relación de potencia LOS/NLOS en dB (canales Rice y Shadowed-Rician).\n"
             "Valores razonables típicos:\n"
-            "• Entornos suburbanos: 6.0 a 15.0 dB (recomendado por defecto: 6.0 dB)\n"
-            "• LOS débil: 0 a 3 dB (tiende a Rayleigh cuando K → -∞)\n"
+            "• Entornos suburbanos / satelital AS: 4.0 a 15.0 dB (por defecto: 6.0 dB)\n"
+            "• LOS débil / sombreado fuerte: -1 a 3 dB (tiende a Rayleigh si K → -∞)\n"
             "• LOS fuerte: > 10 dB (tiende a AWGN)"
         )
         self._add_row_with_tip(
@@ -1014,6 +1264,26 @@ class PolarSimGUI(QMainWindow):
             "• Sombreado leve: ~2.0 dB\n"
             "• Sombreado moderado: 4.0 dB\n"
             "• Sombreado severo: 6.0 dB (recomendado por defecto: 6.0 dB)"
+        )
+        self._add_row_with_tip(
+            form, "Parámetro Nakagami m:", self.spin_m_nakagami,
+            "Parámetro de forma m >= 0.5 (canales Nakagami-m y Shadowed-Rician).\n"
+            "Valores razonables típicos:\n"
+            "• m = 0.5: desvanecimiento muy severo (peor que Rayleigh)\n"
+            "• m = 1.0: equivale a Rayleigh (en Shadowed-Rician: sombreado fuerte FHS)\n"
+            "• m = 1.5–5.0: desvanecimiento moderado / sombreado satelital medio (AS)\n"
+            "• m >= 10: sombreado leve (tiende a Rice / AWGN)"
+        )
+        self._add_row_with_tip(
+            form, "Prob. impulso p:", self.spin_imp_prob,
+            "Probabilidad por símbolo de sufrir un pulso de ruido (solo canal Impulsive).\n"
+            "Valores típicos: 0.01 (1% raro) a 0.10 (10% frecuente); recomendado: 0.05."
+        )
+        self._add_row_with_tip(
+            form, "Razón impulsiva Γ:", self.spin_imp_gamma,
+            "Relación de potencia entre ruido impulsivo y ruido de fondo (solo canal Impulsive).\n"
+            "La potencia media total se normaliza a N0.\n"
+            "Valores típicos: 10 (moderado) a 100 (severo); recomendado: 50."
         )
         return grp
 
@@ -1042,7 +1312,7 @@ class PolarSimGUI(QMainWindow):
             "(recomendado con desvanecimiento)\n"
             "• zf: invierte directamente la ganancia del canal "
             "(amplifica ruido en desvanecimientos profundos)\n"
-            "• no_eq: sin ecualización (solo disponible para canal AWGN)"
+            "• no_eq: sin ecualización (solo disponible para canales AWGN e Impulsive)"
         )
         self._add_row_with_tip(
             form, "Tamaño de lista SCL:", self.combo_scl,
@@ -1114,12 +1384,11 @@ class PolarSimGUI(QMainWindow):
         snr_tooltip = (
             "Eb/N0 de diseño Monte Carlo [dB] para separar bit-canales ruidosos (congelados) "
             "de los confiables.\n"
-            "Pulse '⚡ Auto' para estimarlo según su configuración, o use los valores verificados (R = 0.5):\n"
-            "• AWGN: -1.2 dB\n"
-            "• Rayleigh: 1.0 dB\n"
-            "• Rice (K=6 dB): -0.3 dB\n"
-            "• Lognormal (σ=6 dB): 2.4 dB (o ~1.8 dB para N=128)\n"
-            "• Suzuki (σ=6 dB): 5.0 dB (o ~4.0 dB para N=128)"
+            "Pulse '⚡ Auto' para estimarlo según su configuración, o use los valores guía (R = 0.5):\n"
+            "• AWGN: -1.2 dB | Impulsive (p=0.05, Γ=50): -1.9 dB\n"
+            "• Rayleigh: 1.0 dB | Nakagami (m=1.5): 0.3 dB\n"
+            "• Rice (K=6 dB): -0.3 dB | Shadowed-Rician (K=6, m=1.5): 0.5 dB\n"
+            "• Lognormal (σ=6 dB): 2.4 dB | Suzuki (σ=6 dB): 5.0 dB"
         )
         lbl_snr_sim = QLabel("SNR de diseño [dB]:")
         lbl_snr_sim.setToolTip(snr_tooltip)
@@ -1249,7 +1518,7 @@ class PolarSimGUI(QMainWindow):
         self.log_console.setReadOnly(True)
         self.log_console.setMaximumBlockCount(5000)
         self.log_console.setStyleSheet(
-            "background-color: #1e1e1e; color: #d4d4d4; font-family: monospace;"
+            'background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas, "Courier New", monospace;'
         )
         right_layout.addWidget(self.log_console, stretch=1)
         return right_widget
@@ -1426,7 +1695,7 @@ class PolarSimGUI(QMainWindow):
         N = self.combo_N.currentData()
         if N is not None:
             self.spin_coher.setValue(N if checked else max(1, N // 16))
-        is_fading_channel = (self.combo_canal.currentText() != "awgn")
+        is_fading_channel = self.combo_canal.currentText() not in NON_FADING_CHANNELS
         self.spin_coher.setEnabled(is_fading_channel and not checked)
 
     # Actualiza los valores SNR, parámetros aplicables y opciones válidas al cambiar de canal.
@@ -1435,17 +1704,20 @@ class PolarSimGUI(QMainWindow):
             self.spin_snr_sim.setValue(CHANNEL_SNR_DEFAULTS[channel_name])
 
         # Habilita solo los parámetros físicos pertinentes al canal seleccionado.
-        is_fading = (channel_name != "awgn")
+        is_fading = channel_name not in NON_FADING_CHANNELS
         self.chk_flat_fading.setEnabled(is_fading)
         self.spin_coher.setEnabled(is_fading and not self.chk_flat_fading.isChecked())
-        self.spin_k_db.setEnabled(channel_name == "rice")
+        self.spin_k_db.setEnabled(channel_name in ("rice", "shadowed_rician"))
         self.spin_sigma_db.setEnabled(channel_name in ("lognormal", "suzuki"))
+        self.spin_m_nakagami.setEnabled(channel_name in ("nakagami", "shadowed_rician"))
+        self.spin_imp_prob.setEnabled(channel_name == "impulsive")
+        self.spin_imp_gamma.setEnabled(channel_name == "impulsive")
         self.update_equalizer_options(channel_name)
 
-    # Permite sin_ecualizar solo con el canal AWGN.
+    # Permite sin_ecualizar solo en canales sin desvanecimiento multiplicativo (AWGN e Impulsive).
     def update_equalizer_options(self, channel_name):
         no_eq_index = self.combo_eq.findText("no_eq")
-        no_eq_enabled = (channel_name == "awgn")
+        no_eq_enabled = channel_name in NON_FADING_CHANNELS
         model = self.combo_eq.model()
         if isinstance(model, QStandardItemModel) and no_eq_index >= 0:
             item = model.item(no_eq_index)
@@ -1457,7 +1729,7 @@ class PolarSimGUI(QMainWindow):
 
     # Reúne una configuración consistente antes de iniciar una simulación.
     def gather_parameters(self):
-        if self.combo_canal.currentText() != "awgn" and self.combo_eq.currentText() == "no_eq":
+        if self.combo_canal.currentText() not in NON_FADING_CHANNELS and self.combo_eq.currentText() == "no_eq":
             self.combo_eq.setCurrentText("mmse")
         return {
             'seed': self.spin_seed.value(),
@@ -1469,6 +1741,9 @@ class PolarSimGUI(QMainWindow):
             'bloq_coher': self.spin_coher.value(),
             'k_factor_db': self.spin_k_db.value(),
             'sigma_db': self.spin_sigma_db.value(),
+            'm_nakagami': self.spin_m_nakagami.value(),
+            'imp_prob': self.spin_imp_prob.value(),
+            'imp_gamma': self.spin_imp_gamma.value(),
             'ecualizador': self.combo_eq.currentText(),
             'list_scl': self.combo_scl.currentData(),
             'LLR_clip': self.spin_llr.value(),
@@ -1497,7 +1772,7 @@ class PolarSimGUI(QMainWindow):
                 "Nota: 64-QAM (6 bits/símbolo) es incompatible con longitudes Polar potencias de 2."
             )
 
-        if params['canal'] != "awgn" and not (1 <= params['bloq_coher'] <= N):
+        if params['canal'] not in NON_FADING_CHANNELS and not (1 <= params['bloq_coher'] <= N):
             errors.append(f"El bloque de coherencia ({params['bloq_coher']}) debe estar entre 1 y N ({N}).")
 
         if mode == "ber":
@@ -1528,7 +1803,7 @@ class PolarSimGUI(QMainWindow):
 
     # Verifica si los metadatos de un respaldo .npz son aplicables a los controles de la interfaz.
     def is_backup_meta_applicable(self, loaded_bits, saved_index, saved_meta):
-        if not isinstance(saved_meta, dict) or not all(k in saved_meta for k in MC_BACKUP_KEYS):
+        if not isinstance(saved_meta, dict) or not all(k in saved_meta for k in MC_BACKUP_CORE_KEYS):
             return False
         try:
             backup_N = int(saved_meta["N"])
@@ -1575,6 +1850,9 @@ class PolarSimGUI(QMainWindow):
         self.spin_coher.setValue(backup_coher)
         self.spin_k_db.setValue(float(saved_meta["k_factor_db"]))
         self.spin_sigma_db.setValue(float(saved_meta["sigma_db"]))
+        self.spin_m_nakagami.setValue(float(saved_meta.get("m_nakagami", 1.5)))
+        self.spin_imp_prob.setValue(float(saved_meta.get("imp_prob", 0.05)))
+        self.spin_imp_gamma.setValue(float(saved_meta.get("imp_gamma", 50.0)))
 
         eq_idx = self.combo_eq.findText(str(saved_meta["ecualizador"]))
         if eq_idx >= 0:
@@ -1618,12 +1896,22 @@ class PolarSimGUI(QMainWindow):
             return ("fresh", backup_file, None)
         return ("cancel", None, None)
 
+    # Compara metadatos de respaldo de forma retrocompatible con respaldos de 10 claves.
+    @staticmethod
+    def _backup_meta_matches(saved_meta, current_meta):
+        if not isinstance(saved_meta, dict):
+            return False
+        keys_to_check = [k for k in MC_BACKUP_KEYS if k in saved_meta]
+        if not all(k in saved_meta for k in MC_BACKUP_CORE_KEYS):
+            return False
+        return all(saved_meta.get(k) == current_meta.get(k) for k in keys_to_check)
+
     # Diálogo cuando el respaldo tiene parámetros distintos (permite actualizar y reanudar).
     def _prompt_mismatched_backup(self, backup_file, same_N_backup, loaded_bits, saved_index, saved_meta, current_meta):
         diffs = [
             f"{k}: respaldo={saved_meta.get(k)} vs actual={current_meta.get(k)}"
             for k in MC_BACKUP_KEYS
-            if saved_meta.get(k) != current_meta.get(k)
+            if k in saved_meta and saved_meta.get(k) != current_meta.get(k)
         ]
         diff_text = (
             "\n".join(diffs)
@@ -1677,7 +1965,12 @@ class PolarSimGUI(QMainWindow):
                 return ("cancel", None, None)
 
             current_meta = extract_mc_backup_meta(params)
-            if same_N_backup and len(loaded_bits) == N and saved_meta == current_meta and 0 <= saved_index <= N:
+            if (
+                same_N_backup
+                and len(loaded_bits) == N
+                and self._backup_meta_matches(saved_meta, current_meta)
+                and 0 <= saved_index <= N
+            ):
                 return self._prompt_matching_backup(backup_file, saved_index, N)
             return self._prompt_mismatched_backup(
                 backup_file, same_N_backup, loaded_bits, saved_index, saved_meta, current_meta
@@ -1724,7 +2017,7 @@ class PolarSimGUI(QMainWindow):
             file_path = self._prompt_csv_save_path("Guardar archivo CSV de BER_bits", default_path)
             if not file_path:
                 return
-            pd.DataFrame({"BER bits": self.ber_bits}).to_csv(file_path, index=True)
+            pd.DataFrame({"BER bits": self.ber_bits}).to_csv(file_path, index=True, encoding="utf-8-sig")
             self.ber_bits_source = file_path
             self.update_mc_status_label()
             self.log(f"💾 CSV de BER_bits guardado en: {file_path}")
@@ -1740,7 +2033,7 @@ class PolarSimGUI(QMainWindow):
             return
 
         try:
-            df = pd.read_csv(file_path)
+            df = pd.read_csv(file_path, encoding="utf-8-sig")
             if "BER bits" not in df.columns:
                 raise ValueError("El archivo CSV no contiene la columna 'BER bits'.")
 
@@ -1795,7 +2088,7 @@ class PolarSimGUI(QMainWindow):
                 return
             data = {"Eb/N0 [dB]": self.ber_curves_ebno}
             data.update(self.ber_curves_data)
-            pd.DataFrame(data).to_csv(file_path, index=False)
+            pd.DataFrame(data).to_csv(file_path, index=False, encoding="utf-8-sig")
             self.log(f"💾 CSV de curvas BER guardado en: {file_path}")
         except Exception as e:
             QMessageBox.critical(self, "Error al Guardar CSV", str(e))
@@ -1863,6 +2156,79 @@ class PolarSimGUI(QMainWindow):
             self.snr_worker.deleteLater()
             self.snr_worker = None
 
+    # Aplica en la interfaz los ajustes de reducción sugeridos por la verificación de recursos.
+    def _apply_resource_recommendations(self, recommendations):
+        if 'N' in recommendations:
+            idx = self.combo_N.findData(int(recommendations['N']))
+            if idx >= 0:
+                self.combo_N.setCurrentIndex(idx)
+        if 'lote_mc' in recommendations:
+            self.spin_lote_mc.setValue(int(recommendations['lote_mc']))
+        if 'num_iter' in recommendations:
+            self.spin_num_iter.setValue(int(recommendations['num_iter']))
+        if 'lote_berplot' in recommendations:
+            self.spin_lote_ber.setValue(int(recommendations['lote_berplot']))
+        if 'ebno_rango' in recommendations:
+            self.spin_ebno_rango.setValue(int(recommendations['ebno_rango']))
+        if 'list_scl' in recommendations:
+            scl_idx = self.combo_scl.findData(int(recommendations['list_scl']))
+            if scl_idx >= 0:
+                self.combo_scl.setCurrentIndex(scl_idx)
+
+    # Pre-verifica CPU/GPU y RAM antes de lanzar Monte Carlo o BER, sugiriendo reducir carga si aplica.
+    def precheck_system_resources(self, params, mode, lock_n=False):
+        warnings, recommendations, summary = assess_system_resources(
+            params, mode, has_gpu=HAS_GPU, lock_n=lock_n
+        )
+        if not warnings:
+            return True, params
+
+        labels = {
+            'N': "Longitud N",
+            'lote_mc': "Lote paralelo MC",
+            'num_iter': "Iteraciones MC",
+            'lote_berplot': "Tamaño de lote BER",
+            'ebno_rango': "Puntos Eb/N0",
+            'list_scl': "Tamaño lista SCL",
+        }
+        rec_lines = [
+            f"• {labels.get(k, k)}: {params[k]} → {v}"
+            for k, v in recommendations.items()
+        ]
+        dev_str = COMPUTE_DEVICE_INFO if summary["has_gpu"] else f"CPU ({summary['cores']} hilos)"
+        body = (
+            f"Recursos detectados: {dev_str} | "
+            f"RAM disponible: {summary['avail_gb']:.1f} GB ({summary['mem_pct']:.0f}% en uso)\n\n"
+            "Advertencias:\n• " + "\n• ".join(warnings)
+        )
+        if rec_lines:
+            body += "\n\nReducción de parámetros recomendada:\n" + "\n".join(rec_lines)
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Verificación de Recursos del Sistema")
+        msg.setText(body)
+        btn_apply = (
+            msg.addButton("Aplicar recomendaciones y continuar", QMessageBox.ButtonRole.AcceptRole)
+            if recommendations else None
+        )
+        btn_continue = msg.addButton("Continuar sin cambios", QMessageBox.ButtonRole.ActionRole)
+        msg.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if btn_apply is not None and clicked == btn_apply:
+            self._apply_resource_recommendations(recommendations)
+            updated = self.gather_parameters()
+            self.log(
+                "⚙️ Parámetros ajustados según recursos disponibles: "
+                + ", ".join(f"{k}={v}" for k, v in recommendations.items())
+            )
+            return True, updated
+        if clicked == btn_continue:
+            return True, params
+        return False, params
+
     # Inicia y supervisa la generación Monte Carlo de bits congelados.
     def start_monte_carlo(self):
         if self.has_active_worker():
@@ -1882,6 +2248,9 @@ class PolarSimGUI(QMainWindow):
             return
 
         resume_flag = action in ("resume", "update_and_resume")
+        proceed, params = self.precheck_system_resources(params, mode="mc", lock_n=resume_flag)
+        if not proceed or not self.validate_parameters(params, mode="mc"):
+            return
         self.active_mc_params = dict(params)
         self.set_simulation_running(True, mode="mc")
         self.progress_bar.setRange(0, params['N'])
@@ -1948,6 +2317,11 @@ class PolarSimGUI(QMainWindow):
 
         params = self.gather_parameters()
         if not self.validate_parameters(params, mode="ber"):
+            return
+
+        has_matching_bits = self.ber_bits is not None and len(self.ber_bits) == params['N']
+        proceed, params = self.precheck_system_resources(params, mode="ber", lock_n=has_matching_bits)
+        if not proceed or not self.validate_parameters(params, mode="ber"):
             return
 
         self.active_ber_params = dict(params)
