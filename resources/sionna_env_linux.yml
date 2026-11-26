@@ -1,5 +1,5 @@
-# Entorno Conda/Mamba optimizado para Linux (gui.py y main.ipynb)
-# Uso: mamba env create -f resources/sionna_env_linux.yml
+# Entorno Conda optimizado para Linux
+# Uso: conda env create -f resources/sionna_env_linux.yml
 name: sionna
 channels:
   - conda-forge
@@ -7,8 +7,10 @@ dependencies:
   - python=3.12
   - pip
   - numpy>=1.26,<2.0
+  - scipy
   - pandas>=2.0,<3.0
   - matplotlib>=3.8
+  - seaborn
   - psutil>=5.9
   - pyqt6>=6.6
   - ipykernel

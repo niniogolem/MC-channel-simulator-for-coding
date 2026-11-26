@@ -1,0 +1,124 @@
+===========================================================================
+Installation & Setup Guide — Running gui.py on Windows (with WSL2)
+===========================================================================
+
+This guide provides step-by-step instructions to set up and run gui.py on a
+clean Microsoft Windows 10/11 PC that already has WSL2 (Ubuntu) installed.
+
+Why use WSL2?
+  Sionna 1.2.x requires TensorFlow 2.19.x, which only provides NVIDIA GPU
+  acceleration on Linux/WSL2 (on native Windows it runs strictly on CPU).
+  Windows 10/11 includes WSLg, which displays the PyQt6 graphical window
+  directly on the Windows desktop.
+
+
+---------------------------------------------------------------------------
+0. Prerequisites (on Windows)
+---------------------------------------------------------------------------
+1. Verify that WSL2 and Ubuntu are installed and up to date. In PowerShell:
+
+       wsl --update
+       wsl --status
+
+2. (If you have an NVIDIA GPU) Install the latest NVIDIA Game Ready or
+   Studio driver on Windows from https://www.nvidia.com/drivers
+   IMPORTANT: Do NOT install Linux NVIDIA drivers inside WSL2; WSL2
+   automatically uses the driver installed on Windows.
+
+
+---------------------------------------------------------------------------
+1. Install Required System Libraries in WSL2 (Ubuntu)
+---------------------------------------------------------------------------
+Open the Ubuntu (WSL2) terminal and install Git along with the minimal
+Qt6/OpenGL libraries required by PyQt6 under WSLg:
+
+    sudo apt update
+    sudo apt install -y git curl libgl1 libegl1 libxkbcommon-x11-0 libxcb-cursor0
+
+
+---------------------------------------------------------------------------
+2. Install Miniforge (Conda) inside WSL2
+---------------------------------------------------------------------------
+Skip this step if you already have conda installed in WSL2.
+
+    curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+    bash Miniforge3-Linux-x86_64.sh -b -p "$HOME/miniforge3"
+    "$HOME/miniforge3/bin/conda" init bash
+
+Close and reopen the Ubuntu terminal (or run `source ~/.bashrc`) so that
+`conda` is available as a command.
+
+
+---------------------------------------------------------------------------
+3. Clone the Repository into the WSL2 Filesystem
+---------------------------------------------------------------------------
+
+    mkdir -p ~/Code
+    cd ~/Code
+    git clone https://github.com/niniogolem/MC-channel-simulator-for-coding.git
+    cd MC-channel-simulator-for-coding
+
+
+---------------------------------------------------------------------------
+4. Create the Conda Environment
+---------------------------------------------------------------------------
+Option A — Recommended (NVIDIA GPU or CPU inside WSL2):
+
+    conda env create -f resources/sionna_env_windows.yml
+    conda activate sionna
+
+Option B — Lightweight CPU-only install (no NVIDIA GPU, smaller download):
+
+    conda create -n sionna python=3.12 pyqt6 numpy=1.26.4 "pandas>=2.0,<3.0" matplotlib seaborn psutil ipykernel jupyterlab -c conda-forge -y
+    conda activate sionna
+    pip install tensorflow==2.19.1 sionna==1.2.2
+
+
+---------------------------------------------------------------------------
+5. Verify the Environment
+---------------------------------------------------------------------------
+Run a quick check to confirm that TensorFlow, Sionna, and PyQt6 load
+properly:
+
+    python -c "import tensorflow as tf, sionna, PyQt6; print('TF:', tf.__version__, '| Sionna:', sionna.__version__, '| GPUs:', tf.config.list_physical_devices('GPU'))"
+
+- With an NVIDIA GPU: `GPUs:` should list `[PhysicalDevice(name='/physical_device:GPU:0', ...)]`.
+- Without an NVIDIA GPU: `GPUs:` will show `[]` and the simulator will
+  automatically run on CPU (showing recommendations to reduce workload
+  before heavy simulations).
+
+
+---------------------------------------------------------------------------
+6. Launch the Graphical Interface (GUI)
+---------------------------------------------------------------------------
+From the repository folder with the `sionna` environment active:
+
+    python gui.py
+
+To force CPU execution (even if a GPU is present):
+
+    python gui.py --cpu
+
+
+---------------------------------------------------------------------------
+Troubleshooting (Windows / WSL2)
+---------------------------------------------------------------------------
+- The GUI window does not open or shows "Could not load the Qt platform plugin 'xcb'":
+    1. Run `wsl --update` in Windows PowerShell and restart WSL (`wsl --shutdown`).
+    2. Verify the system libraries from Step 1:
+       `sudo apt install -y libxcb-cursor0 libxkbcommon-x11-0 libgl1 libegl1`
+    3. Try forcing the X11 backend:
+       `QT_QPA_PLATFORM=xcb python gui.py`
+
+- The GPU is not detected inside WSL2:
+    1. Run `nvidia-smi` in the Ubuntu terminal. If it fails, update the
+       NVIDIA driver on Windows and run `wsl --shutdown` in PowerShell.
+
+- Running on native Windows (without WSL2, CPU only):
+    Install Python 3.12 from python.org and run in PowerShell inside the
+    repository folder:
+        python -m venv .venv
+        .\.venv\Scripts\Activate.ps1
+        pip install tensorflow==2.19.1 sionna==1.2.2 numpy==1.26.4 "pandas>=2.0,<3.0" matplotlib seaborn PyQt6 psutil ipykernel jupyterlab
+        python gui.py
+    Note: On native Windows, TensorFlow 2.19 runs strictly on CPU.

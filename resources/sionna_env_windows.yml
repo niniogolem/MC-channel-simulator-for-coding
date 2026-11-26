@@ -1,3 +1,5 @@
+# Entorno Conda optimizado para Windows con WSL2
+# Uso: conda env create -f resources/sionna_env_windows.yml
 name: sionna
 channels:
   - conda-forge
@@ -6,10 +8,9 @@ dependencies:
   - pip
   - numpy>=1.26,<2.0
   - scipy
-  - pandas>=2.0
+  - pandas>=2.0,<3.0
   - matplotlib>=3.8
   - seaborn
-  - tqdm
   - psutil>=5.9
   - pyqt6>=6.6
   - ipykernel

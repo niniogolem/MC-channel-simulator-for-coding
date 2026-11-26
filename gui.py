@@ -651,7 +651,7 @@ class CodigoPolarCRC(BaseSystemBlock):
         b = self.cb['datos']([batch_size, K_efec])
         bits_codif = self.polar_codif(self.cb['crc_codif'](b))
         x = self.cb['mapeador'](self.cb['interleaver'](bits_codif))
-        llr = self.apply_channel_and_eq(x, ebno_db, coderate=self.p['K'] / self.p['N'])
+        llr = self.apply_channel_and_eq(x, ebno_db, coderate=K_efec / self.p['N'])
         b_hat = self.polar_decodif(llr)[..., :K_efec]
         return b, b_hat
 

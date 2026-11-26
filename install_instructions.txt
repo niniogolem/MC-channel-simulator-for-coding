@@ -37,24 +37,21 @@ Qt6/OpenGL requeridas por PyQt6 bajo WSLg:
 
 
 ---------------------------------------------------------------------------
-2. Instalar Miniforge (Conda + Mamba) dentro de WSL2
+2. Instalar Miniforge (Conda) dentro de WSL2
 ---------------------------------------------------------------------------
-Omita este paso si ya tiene conda o mamba instalado en WSL2.
+Omita este paso si ya tiene conda instalado en WSL2.
 
     curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
     bash Miniforge3-Linux-x86_64.sh -b -p "$HOME/miniforge3"
     "$HOME/miniforge3/bin/conda" init bash
 
 Cierre y vuelva a abrir la terminal de Ubuntu (o ejecute `source ~/.bashrc`)
-para que `conda` y `mamba` queden disponibles en el PATH.
+para que `conda` quede disponible como comando.
 
 
 ---------------------------------------------------------------------------
 3. Clonar el Repositorio en el Sistema de Archivos de WSL2
 ---------------------------------------------------------------------------
-Consejo: Clone siempre el proyecto dentro de su directorio personal de Linux
-(`~`), NO en `/mnt/c/...`, para obtener mucho mejor rendimiento en disco y
-evitar problemas de bloqueo de archivos.
 
     mkdir -p ~/Code
     cd ~/Code
@@ -67,16 +64,14 @@ evitar problemas de bloqueo de archivos.
 ---------------------------------------------------------------------------
 Opción A — Recomendada (GPU NVIDIA o CPU dentro de WSL2):
 
-    mamba env create -f resources/sionna_env_windows.yml
+    conda env create -f resources/sionna_env_windows.yml
     conda activate sionna
-
-  (Si no tiene `mamba`, use `conda env create -f resources/sionna_env_windows.yml`.)
 
 Opción B — Instalación ligera solo CPU (sin GPU NVIDIA, descarga más pequeña):
 
-    mamba create -n sionna python=3.12 pyqt6 -c conda-forge -y
+    conda create -n sionna python=3.12 pyqt6 numpy=1.26.4 "pandas>=2.0,<3.0" matplotlib seaborn psutil ipykernel jupyterlab -c conda-forge -y
     conda activate sionna
-    pip install -r requirements.txt
+    pip install tensorflow==2.19.1 sionna==1.2.2
 
 
 ---------------------------------------------------------------------------
@@ -124,6 +119,6 @@ Solución de Problemas (Windows / WSL2)
     carpeta del repositorio:
         python -m venv .venv
         .\.venv\Scripts\Activate.ps1
-        pip install -r requirements.txt
+        pip install tensorflow==2.19.1 sionna==1.2.2 numpy==1.26.4 "pandas>=2.0,<3.0" matplotlib seaborn PyQt6 psutil ipykernel jupyterlab
         python gui.py
     Nota: En Windows nativo, TensorFlow 2.19 se ejecuta estrictamente en CPU.
