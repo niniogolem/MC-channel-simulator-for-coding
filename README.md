@@ -58,7 +58,7 @@ conda activate sionna
 conda env create -f resources/sionna_env_windows.yml
 conda activate sionna
 ```
-See [`install_instructions_en.txt`](install_instructions_en.txt) (English) or [`install_instructions.txt`](install_instructions.txt) (Spanish) for complete step-by-step Windows + WSL2 setup instructions (including Qt6/WSLg dependencies and troubleshooting).
+See [`install_instructions_en.txt`](install_instructions_en.txt) (English) or [`install_instructions_es.txt`](install_instructions_es.txt) (Spanish) for complete step-by-step Windows + WSL2 setup instructions (including Qt6/WSLg dependencies and troubleshooting).
 
 ### Running the Software
 - **Desktop GUI (GPU if available, otherwise CPU):**
