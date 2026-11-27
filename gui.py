@@ -118,7 +118,7 @@ PREDEFINED_CODE_RATES = [
     ("7/8 (0.875)", 7 / 8),
 ]
 
-# Valores guía de SNR de diseño [dB] por canal (verificados para R = 0.5).
+# Valores guía de SNR de diseño [dB] por canal (verificados para R = 0.5, BPSK, CSI perfecto).
 CHANNEL_SNR_DEFAULTS = {
     "awgn": -1.2,
     "rayleigh": 1.0,
@@ -127,15 +127,19 @@ CHANNEL_SNR_DEFAULTS = {
     "suzuki": 5.0,
     "nakagami": 0.3,
     "shadowed_rician": 0.5,
-    "impulsive": -1.9,
+    "impulsive": -5.7,
+}
+IMPULSIVE_SNR_DEFAULTS = {
+    "mixture": -5.7,
+    "gaussian": -1.9,
 }
 
 AVAILABLE_CHANNELS = (
-    "suzuki",
     "awgn",
     "rayleigh",
     "rice",
     "lognormal",
+    "suzuki",
     "nakagami",
     "shadowed_rician",
     "impulsive",
@@ -183,7 +187,7 @@ TOOLTIPS = {
     ),
     "N": (
         "Longitud de palabra código Polar N (debe ser potencia de 2).\n"
-        "Valores típicos: 128, 256, 512 o 1024 (por defecto: 1024)."
+        "Valores típicos: 128, 256, 512 o 1024 (por defecto: 512)."
     ),
     "rate": (
         "Tasas de código estándar predefinidas (K se calcula automáticamente como N × R).\n"
@@ -286,17 +290,17 @@ TOOLTIPS = {
     ),
     "lote_mc": (
         "Muestras procesadas en paralelo por cada paso Monte Carlo (consume RAM/VRAM).\n"
-        "Recomendado: 2000 (reducir si el uso de memoria es elevado)."
+        "Recomendado: 1000 (reducir si el uso de memoria es elevado)."
     ),
     "num_iter": (
         "Número de lotes secuenciales acumulados por bit-canal (afecta el tiempo de ejecución).\n"
-        "Recomendado: 2000 (2000 × 2000 = 4,000,000 bits/bit-canal)."
+        "Recomendado: 1000 (1000 × 1000 = 1,000,000 bits/bit-canal)."
     ),
     "snr_sim": (
         "Eb/N0 de diseño Monte Carlo [dB] para separar bit-canales ruidosos (congelados) "
         "de los confiables.\n"
         "Pulse '⚡ Auto' para estimarlo según su configuración, o use los valores guía (R = 0.5):\n"
-        "• AWGN: -1.2 dB | Impulsive (p=0.05, Γ=50): -1.9 dB\n"
+        "• AWGN: -1.2 dB | Impulsive (p=0.05, Γ=50): -5.7 dB (mixture) / -1.9 dB (gaussian)\n"
         "• Rayleigh: 1.0 dB | Nakagami (m=1.5): 0.3 dB\n"
         "• Rice (K=6 dB): -0.3 dB | Shadowed-Rician (K=6, m=1.5): 0.5 dB\n"
         "• Lognormal (σ=6 dB): 2.4 dB | Suzuki (σ=6 dB): 5.0 dB"
@@ -312,12 +316,12 @@ TOOLTIPS = {
     ),
     "ebno_max": (
         "Fin del barrido de Eb/N0 en dB.\n"
-        "Valores típicos: 6–10 dB para AWGN, 15–25 dB para canales con desvanecimiento "
-        "(por defecto: 20.0 dB)."
+        "Valores típicos: 6–12 dB para AWGN, 15–25 dB para canales con desvanecimiento "
+        "(por defecto: 12.0 dB)."
     ),
     "ebno_rango": (
         "Cantidad de puntos de Eb/N0 equidistantes evaluados en el barrido.\n"
-        "Recomendado: 21 (pasos de 1 dB entre 0 y 20 dB)."
+        "Recomendado: 13 (pasos de 1 dB entre 0 y 12 dB)."
     ),
     "lote_ber": (
         "Palabras código simuladas por lote al evaluar las curvas BER/BLER.\n"
@@ -332,7 +336,7 @@ TOOLTIPS = {
         "Límite máximo de lotes evaluados en cada punto de Eb/N0 si no se alcanzan "
         "los errores de bloque objetivo.\n"
         "Si ocurren 0 errores tras el máximo de iteraciones, los puntos superiores se omiten.\n"
-        "Por defecto: 100."
+        "Por defecto: 50."
     ),
 }
 
@@ -1815,7 +1819,7 @@ class PolarSimGUI(QMainWindow):
         self.combo_N = QComboBox()
         for exp in range(5, 14):  # 32 a 8192
             self.combo_N.addItem(str(2 ** exp), 2 ** exp)
-        self.combo_N.setCurrentText("1024")
+        self.combo_N.setCurrentText("512")
         self.combo_N.currentIndexChanged.connect(self.on_N_changed)
 
         self.combo_rate = QComboBox()
@@ -1860,7 +1864,7 @@ class PolarSimGUI(QMainWindow):
             self.combo_canal.addItem(c)
         self.combo_canal.currentTextChanged.connect(self.on_channel_changed)
 
-        self.spin_coher = self._make_spinbox(1, 8192, 64)
+        self.spin_coher = self._make_spinbox(1, 8192, 32)
 
         self.chk_flat_fading = QCheckBox("Desvanecimiento plano (bloque = N)")
         self.chk_flat_fading.setChecked(False)
@@ -1891,12 +1895,14 @@ class PolarSimGUI(QMainWindow):
         self.combo_eq = QComboBox()
         for eq in ("mmse", "zf", "no_eq"):
             self.combo_eq.addItem(eq)
+        self.combo_eq.setCurrentText("no_eq")
 
         self.spin_csi_err = self._make_double_spinbox(0.0, 1.0, 0.0, step=0.01, decimals=4)
 
         self.combo_imp_demapper = QComboBox()
         self.combo_imp_demapper.addItem("Mezcla óptima (APP)", "mixture")
         self.combo_imp_demapper.addItem("Gaussiano desajustado", "gaussian")
+        self.combo_imp_demapper.currentIndexChanged.connect(self.on_imp_demapper_changed)
 
         self.combo_scl = QComboBox()
         for list_size in (1, 2, 4, 8, 16, 32):
@@ -1917,13 +1923,13 @@ class PolarSimGUI(QMainWindow):
         grp = QGroupBox("4. Diseño Polar por Monte Carlo")
         form = QFormLayout(grp)
 
-        self.spin_lote_mc = self._make_spinbox(10, 50000, 2000, step=500)
+        self.spin_lote_mc = self._make_spinbox(10, 50000, 1000, step=500)
         self.spin_lote_mc.valueChanged.connect(self.update_mc_summary_label)
 
-        self.spin_num_iter = self._make_spinbox(1, 50000, 2000, step=500)
+        self.spin_num_iter = self._make_spinbox(1, 50000, 1000, step=500)
         self.spin_num_iter.valueChanged.connect(self.update_mc_summary_label)
 
-        self.spin_snr_sim = self._make_double_spinbox(-20.0, 40.0, 5.0, step=0.5)
+        self.spin_snr_sim = self._make_double_spinbox(-20.0, 40.0, -1.2, step=0.5)
         self.spin_snr_sim.setToolTip(TOOLTIPS["snr_sim"])
 
         self.btn_auto_snr = QPushButton("⚡ Auto")
@@ -1959,11 +1965,11 @@ class PolarSimGUI(QMainWindow):
         form = QFormLayout(grp)
 
         self.spin_ebno_min = self._make_double_spinbox(-20.0, 50.0, 0.0)
-        self.spin_ebno_max = self._make_double_spinbox(-20.0, 50.0, 20.0)
-        self.spin_ebno_rango = self._make_spinbox(2, 100, 21)
+        self.spin_ebno_max = self._make_double_spinbox(-20.0, 50.0, 12.0)
+        self.spin_ebno_rango = self._make_spinbox(2, 100, 13)
         self.spin_lote_ber = self._make_spinbox(10, 10000, 200)
         self.spin_target_block_errors = self._make_spinbox(10, 10000, 250, step=50)
-        self.spin_max_iter_ber = self._make_spinbox(1, 100000, 100, step=25)
+        self.spin_max_iter_ber = self._make_spinbox(1, 100000, 50, step=25)
 
         self._add_row_with_tip(form, "Eb/N0 mín [dB]:", self.spin_ebno_min, TOOLTIPS["ebno_min"])
         self._add_row_with_tip(form, "Eb/N0 máx [dB]:", self.spin_ebno_max, TOOLTIPS["ebno_max"])
@@ -2303,9 +2309,18 @@ class PolarSimGUI(QMainWindow):
         is_fading_channel = self.combo_canal.currentText() not in NON_FADING_CHANNELS
         self.spin_coher.setEnabled(is_fading_channel and not checked)
 
+    def on_imp_demapper_changed(self):
+        """Actualiza el SNR guía del canal Impulsive al alternar entre mezcla APP y gaussiano."""
+        if self.combo_canal.currentText() == "impulsive":
+            demap_mode = self.combo_imp_demapper.currentData()
+            self.spin_snr_sim.setValue(IMPULSIVE_SNR_DEFAULTS.get(demap_mode, CHANNEL_SNR_DEFAULTS["impulsive"]))
+
     def on_channel_changed(self, channel_name):
         """Actualiza SNR guía, parámetros físicos habilitados y ecualizadores válidos para el canal."""
-        if channel_name in CHANNEL_SNR_DEFAULTS:
+        if channel_name == "impulsive":
+            demap_mode = self.combo_imp_demapper.currentData()
+            self.spin_snr_sim.setValue(IMPULSIVE_SNR_DEFAULTS.get(demap_mode, CHANNEL_SNR_DEFAULTS["impulsive"]))
+        elif channel_name in CHANNEL_SNR_DEFAULTS:
             self.spin_snr_sim.setValue(CHANNEL_SNR_DEFAULTS[channel_name])
 
         is_fading = channel_name not in NON_FADING_CHANNELS
